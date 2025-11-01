@@ -1,0 +1,145 @@
+/**
+ * Gerenciamento de Ferramentaria - Documentação de Alto Nível
+ *
+ * Objetivo
+ * - Sistema para gerenciar ferramentas, gabaritos e consumíveis em ambiente industrial.
+ * - Persistência completa de ativos, movimentações (empréstimos/devoluções), calibrações,
+ *   manutenção e treinamentos de funcionários para fins de rastreabilidade, auditoria e qualidade.
+ *
+ * Principais Entidades (modelo conceitual)
+ * - Ferramenta (entidade base)
+ *     - id: UUID / código único (RFID / DPM / código de barras)
+ *     - descricao: string
+ *     - categoria: enum {BASICA, ESPECIALIZADA, GABARITO, CONSUMIVEL, MEDICAO}
+ *     - status: enum {DISPONIVEL, EM_USO, EM_CALIBRACAO, EM_MANUTENCAO, BAIXADO}
+ *     - localizacao: string (almoxarifado / setor)
+ *     - dataCadastro: datetime
+ *     - fabricante / numeroSerie: string
+ *     - tipoIdentificacao: enum {RFID, DPM, BARRAS}
+ *
+ * - Gabarito : Ferramenta (especialização)
+ *     - requerDocumentoAssociado: boolean (sempre true para gabaritos)
+ *     - autorizacaoEngenheiro: codigoValidacao? / referenciaUsuario
+ *     - dataUltimaCalibracao: date
+ *     - frequenciaCalibracaoDias: int
+ *
+ * - Consumivel : Ferramenta (especialização)
+ *     - quantidadeAtual: int
+ *     - estoqueMinimo: int
+ *     - unidadeMedida: string
+ *
+ * - FerramentaDeMedicao : Ferramenta (categoria MEDICAO)
+ *     - dataUltimaCalibracao: date
+ *     - frequenciaCalibracaoDias: int
+ *
+ * - Funcionario
+ *     - matricula: string (ou id)
+ *     - nome: string
+ *     - setor: string
+ *     - cargo: string
+ *     - listaTreinamentos: set<string> (códigos/nomes de treinamentos)
+ *     - permissoes: set<role> (CHEFE_FERRAMENTARIA, QUALIDADE, ENGENHEIRO, OPERADOR)
+ *
+ * - Emprestimo (Movimentacao)
+ *     - id: UUID
+ *     - idFerramenta: FK -> Ferramenta.id
+ *     - idFuncionario: FK -> Funcionario.matricula
+ *     - tipoOperacao: enum {EMPRESTIMO, DEVOLUCAO}
+ *     - documentoAssociado: string|null (obrigatório para gabaritos)
+ *     - dataEmprestimo: datetime
+ *     - dataDevolucao: datetime|null
+ *     - statusDevolucao: enum {OK, COM_AVARIA, PENDENTE}
+ *     - operadorFerramentaria: idUsuario (quem aprovou/liberou)
+ *     - observacoes: text
+ *
+ * Regras de negócio principais
+ * - Validação de habilitação:
+ *     - Ao registrar empréstimo, validar a matrícula do funcionário.
+ *     - Se ferramenta é ESPECIALIZADA, checar se funcionario.listaTreinamentos contém o treinamento requerido.
+ *     - Se não habilitado, bloquear operação com motivo.
+ *
+ * - Gabaritos e auditoria:
+ *     - Empréstimo de GABARITO só permitido se documentoAssociado válido for informado (Ordem de Fabricação/Montagem).
+ *     - Opcionalmente, engenheiro pode gerar código de autorização para liberação; esse código deve ser registrado.
+ *     - Persistir associação (idFerramenta, idFuncionario, documentoAssociado, operador) para rastreabilidade.
+ *
+ * - Calibração (controle de qualidade):
+ *     - Ferramentas de medição e gabaritos têm campos dataUltimaCalibracao e frequenciaCalibracaoDias.
+ *     - Empréstimo é bloqueado automaticamente se dataUltimaCalibracao + frequenciaCalibracaoDias < hoje
+ *       (status passa a "EM_CALIBRACAO" ou "CALIBRACAO_PENDENTE").
+ *     - Representante de Qualidade pode marcar item como "EM_CALIBRACAO" e depois atualizar laudo ao retorno.
+ *
+ * - Avarias e manutenção:
+ *     - Na devolução, se statusDevolucao == COM_AVARIA -> setar status ferramenta = EM_MANUTENCAO.
+ *     - Ferramentas EM_MANUTENCAO não podem ser emprestadas até liberação por Qualidade/Chefe.
+ *     - Representante de Qualidade pode decidir destino: liberar, enviar para reparo externo, solicitar reposição/baixa.
+ *
+ * - Consumíveis:
+ *     - Controle de quantidade; quando quantidadeAtual <= estoqueMinimo gerar alerta para Chefe Ferramentaria.
+ *     - Funcionalidade para gerar Lista de Reposição (relatório CSV / integração com compras).
+ *
+ * Persistência e auditoria
+ * - Todas as entidades e todas as movimentações obrigatoriamente persistidas em banco relacional (ex.: PostgreSQL).
+ * - Tabelas mínimas: ferramentas, gabaritos (separated view), consumiveis, funcionarios, movimentacoes, treinamentos,
+ *   manutencoes, calibracoes, auditorias.
+ * - Índices: index em idFerramenta, idFuncionario, dataEmprestimo; constraints FK para integridade.
+ * - Cada operação sensível (empréstimo, devolução, alteração de status, calibração) grava usuário, timestamp e razão.
+ *
+ * API / Serviços (exemplos de métodos)
+ * - EmprestimoService:
+ *     - registrarEmprestimo(ferramentaId, funcionarioId, operadorId, documentoAssociado?): Emprestimo
+ *     - registrarDevolucao(movimentacaoId, operadorId, statusDevolucao, observacoes?): Emprestimo
+ * - FerramentaService:
+ *     - cadastrarFerramenta(dto), atualizarStatus(id, novoStatus, operadorId), verificarDisponibilidade(id): bool
+ * - QualidadeService:
+ *     - marcarEmCalibracao(id, operadorId), registrarRetornoCalibracao(id, laudo, data, operadorId)
+ * - ConsumivelService:
+ *     - usarConsumivel(id, quantidade), reporConsumivel(id, quantidade), gerarListaReposicao()
+ *
+ * Validações e bloqueios transacionais
+ * - Todas as operações de empréstimo/devolução devem ocorrer em transação atômica:
+ *     - Verificar status atual da ferramenta (DISPONIVEL).
+ *     - Validar calibração e habilitação.
+ *     - Inserir registro de movimentação e atualizar status da ferramenta para EM_USO.
+ * - Bloqueios pessimistas/optimistas para evitar dupla retirada (lock por registro ou coluna version).
+ *
+ * Notificações e jobs agendados
+ * - Job diário para:
+ *     - Identificar ferramentas com calibração vencida -> notificar Qualidade / bloquear empréstimo.
+ *     - Verificar consumíveis abaixo do estoque mínimo -> notificar Chefe Ferramentaria.
+ *
+ * Relatórios e consultas essenciais
+ * - Histórico de movimentações por ferramenta (todos os empréstimos/devoluções).
+ * - Pendências por funcionário (ferramentas EM_USO atribuídas a um funcionário).
+ * - Relatório de ferramentas com calibração vencida.
+ * - Lista de consumíveis para reposição.
+ *
+ * Segurança e permissões
+ * - Roles: OPERADOR, CHEFE_FERRAMENTARIA, REPRESENTANTE_QUALIDADE, ENGENHEIRO, ADMIN
+ * - Apenas CHEFE_FERRAMENTARIA pode gerar lista de reposição e liberar pedidos de compra.
+ * - REPRESENTANTE_QUALIDADE pode alterar status de calibração/manutenção e laudos.
+ * - ENGENHEIRO pode emitir autorizações especiais para gabaritos (codigoValidacao).
+ *
+ * Considerações de implementação
+ * - Modelagem limpa com classes/DTOs/Repositorios e serviços transacionais.
+ * - Logs de auditoria imutáveis para movimentações (não sobrescrever histórico).
+ * - API REST/GraphQL para integração com scanners RFID / leitores 2D e com sistema de compras.
+ * - Interfaces para importação de treinamentos do RH e sincronização de usuários.
+ * - Testes automatizados: regras de bloqueio de empréstimo, fluxo de devolução com avaria, geração de alertas de consumíveis.
+ *
+ * Exemplo de enum (resumo)
+ * - CategoriaFerramenta: BASICA, ESPECIALIZADA, GABARITO, CONSUMIVEL, MEDICAO
+ * - StatusFerramenta: DISPONIVEL, EM_USO, EM_CALIBRACAO, EM_MANUTENCAO, BAIXADO
+ * - TipoOperacao: EMPRESTIMO, DEVOLUCAO
+ * - StatusDevolucao: OK, COM_AVARIA
+ *
+ * Padrões recomendados
+ * - Repositories + UnitOfWork / TransactionScope para integridade.
+ * - Domain-driven design para regras críticas (habilitação, calibração).
+ * - Eventos de domínio para notificações (e.g., EventoConsumivelBaixo, EventoCalibracaoVencida).
+ *
+ * Observação
+ * - Esta documentação tem caráter de especificação funcional e técnica de alto nível. Para implementação,
+ *   desenhar diagrama de classes UML detalhado e modelagem relacional física com tipos, limites e índices.
+ */
+
